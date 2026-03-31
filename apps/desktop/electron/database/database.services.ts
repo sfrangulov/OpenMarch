@@ -26,6 +26,58 @@ export class LegacyDatabaseResponse<T> {
 
 /* ============================ DATABASE ============================ */
 let DB_PATH = "";
+let _sqlQueue: Promise<void> = Promise.resolve();
+let persistentConnection: Database.Database | null = null;
+let persistentConnectionPath: string | null = null;
+
+function enqueueSql<T>(job: () => Promise<T>): Promise<T> {
+    const queuedJob = _sqlQueue.then(job);
+    _sqlQueue = queuedJob.then(
+        () => undefined,
+        () => undefined,
+    );
+    return queuedJob;
+}
+
+function resetPersistentConnectionState({ resetQueue = false } = {}) {
+    persistentConnection?.close();
+    persistentConnection = null;
+    persistentConnectionPath = null;
+    if (resetQueue) {
+        _sqlQueue = Promise.resolve();
+    }
+}
+
+function ensurePersistentConnection() {
+    if (persistentConnectionPath !== DB_PATH) {
+        resetPersistentConnectionState();
+    }
+
+    if (!persistentConnection) {
+        persistentConnection = connect();
+        persistentConnection.prepare("PRAGMA journal_mode = WAL").run();
+        persistentConnection.prepare("PRAGMA foreign_keys = ON").run();
+        persistentConnectionPath = DB_PATH;
+    }
+
+    return persistentConnection;
+}
+
+function withPersistentDb<T>(
+    fn: (db: Database.Database) => Promise<T> | T,
+): Promise<T> {
+    return enqueueSql(async () => {
+        const db = ensurePersistentConnection();
+        return await fn(db);
+    });
+}
+
+export const __databaseServiceTestUtils = {
+    enqueueSql,
+    withPersistentDb,
+    resetPersistentConnectionState,
+    getPersistentConnectionPath: () => persistentConnectionPath,
+};
 
 /**
  * Change the location of the database file the application and actively updates.
@@ -37,6 +89,7 @@ export function setDbPath(path: string, isNewFile = false) {
     const failedDb = (message: string, statusCode: number = -1) => {
         console.error(message);
         DB_PATH = "";
+        resetPersistentConnectionState({ resetQueue: true });
         return statusCode;
     };
 
@@ -58,6 +111,9 @@ export function setDbPath(path: string, isNewFile = false) {
         }
     }
 
+    if (path !== DB_PATH) {
+        resetPersistentConnectionState({ resetQueue: true });
+    }
     DB_PATH = path;
     const db = connect();
 
@@ -93,6 +149,7 @@ export function setDbPath(path: string, isNewFile = false) {
         throw err;
     }
 
+    db.close();
     return 200;
 }
 
@@ -209,8 +266,6 @@ export const getOrmConnection = () => {
     return getOrm(persistentConnection);
 };
 
-let persistentConnection: Database.Database | null = null;
-let persistentConnectionPath: string | null = null;
 async function handleSqlProxy(
     _: any,
     sql: string,
@@ -218,24 +273,10 @@ async function handleSqlProxy(
     method: "all" | "run" | "get" | "values",
 ) {
     try {
-        if (persistentConnectionPath !== DB_PATH) {
-            persistentConnection?.close();
-            persistentConnection = null;
-            persistentConnectionPath = null;
-        }
-
-        if (!persistentConnection) {
-            persistentConnection = connect();
-            persistentConnection.prepare("PRAGMA foreign_keys = ON").run();
-            persistentConnectionPath = DB_PATH;
-        }
-
-        return await handleSqlProxyWithDb(
-            persistentConnection,
-            sql,
-            params,
-            method,
-        );
+        return await enqueueSql(async () => {
+            const db = ensurePersistentConnection();
+            return await handleSqlProxyWithDb(db, sql, params, method);
+        });
     } catch (error: any) {
         console.error("Error from SQL proxy:", error);
         throw error;
@@ -245,7 +286,10 @@ async function handleSqlProxy(
 /** Directly executes the SQL query without any parameters */
 async function handleUnsafeSqlProxy(_: any, sql: string) {
     try {
-        return await handleUnsafeSqlProxyWithDb(connect(), sql);
+        return await enqueueSql(async () => {
+            const db = ensurePersistentConnection();
+            return await handleUnsafeSqlProxyWithDb(db, sql);
+        });
     } catch (error: any) {
         console.error("Error from unsafe SQL proxy:", error);
         throw error;
@@ -290,13 +334,16 @@ export function initHandlers() {
 async function getAudioFilesDetails(
     db?: Database.Database,
 ): Promise<AudioFile[]> {
-    const dbToUse = db || connect();
-    const stmt = dbToUse.prepare(
+    if (!db) {
+        return await withPersistentDb(async (persistentDb) =>
+            getAudioFilesDetails(persistentDb),
+        );
+    }
+
+    const stmt = db.prepare(
         `SELECT id, path, nickname, selected FROM ${Constants.AudioFilesTableName}`,
     );
-    const response = stmt.all() as AudioFile[];
-    if (!db) dbToUse.close();
-    return response;
+    return stmt.all() as AudioFile[];
 }
 
 /**
@@ -309,32 +356,32 @@ async function getAudioFilesDetails(
 export async function getSelectedAudioFile(
     db?: Database.Database,
 ): Promise<AudioFile | null> {
-    const dbToUse = db || connect();
-    try {
-        const stmt = dbToUse.prepare(
-            `SELECT * FROM ${Constants.AudioFilesTableName} WHERE selected = 1`,
+    if (!db) {
+        return await withPersistentDb(async (persistentDb) =>
+            getSelectedAudioFile(persistentDb),
         );
-        const result = await stmt.get();
-        if (result) {
-            return result as AudioFile;
-        }
-
-        // If no audio file is selected, select the first one
-        const firstAudioFileStmt = dbToUse.prepare(
-            `SELECT * FROM ${Constants.AudioFilesTableName} LIMIT 1`,
-        );
-        const firstAudioFile = (await firstAudioFileStmt.get()) as AudioFile;
-        if (!firstAudioFile) {
-            console.error("No audio files in the database");
-            return null;
-        }
-        await setSelectAudioFile(firstAudioFile.id);
-        return firstAudioFile as AudioFile;
-    } finally {
-        if (!db) {
-            dbToUse.close();
-        }
     }
+
+    const stmt = db.prepare(
+        `SELECT * FROM ${Constants.AudioFilesTableName} WHERE selected = 1`,
+    );
+    const result = await stmt.get();
+    if (result) {
+        return result as AudioFile;
+    }
+
+    // If no audio file is selected, select the first one
+    const firstAudioFileStmt = db.prepare(
+        `SELECT * FROM ${Constants.AudioFilesTableName} LIMIT 1`,
+    );
+    const firstAudioFile = (await firstAudioFileStmt.get()) as AudioFile;
+    if (!firstAudioFile) {
+        console.error("No audio files in the database");
+        return null;
+    }
+
+    await setSelectAudioFile(firstAudioFile.id, db);
+    return firstAudioFile as AudioFile;
 }
 
 /**
@@ -346,8 +393,14 @@ export async function getSelectedAudioFile(
  */
 async function setSelectAudioFile(
     audioFileId: number,
+    db?: Database.Database,
 ): Promise<AudioFile | null> {
-    const db = connect();
+    if (!db) {
+        return await withPersistentDb(async (persistentDb) =>
+            setSelectAudioFile(audioFileId, persistentDb),
+        );
+    }
+
     const stmt = db.prepare(
         `UPDATE ${Constants.AudioFilesTableName} SET selected = 0`,
     );
@@ -357,21 +410,20 @@ async function setSelectAudioFile(
     );
     await selectStmt.run({ audioFileId });
     const result = await getSelectedAudioFile(db);
-    db.close();
     return result as AudioFile;
 }
 
 export async function insertAudioFile(
     audioFile: AudioFile,
 ): Promise<LegacyDatabaseResponse<AudioFile[]>> {
-    const db = connect();
-    const stmt = db.prepare(
-        `UPDATE ${Constants.AudioFilesTableName} SET selected = 0`,
-    );
-    stmt.run();
-    let output: LegacyDatabaseResponse<AudioFile[]> = { success: false };
-    try {
-        const insertStmt = db.prepare(`
+    return await withPersistentDb(async (db) => {
+        const stmt = db.prepare(
+            `UPDATE ${Constants.AudioFilesTableName} SET selected = 0`,
+        );
+        stmt.run();
+        let output: LegacyDatabaseResponse<AudioFile[]> = { success: false };
+        try {
+            const insertStmt = db.prepare(`
                 INSERT INTO ${Constants.AudioFilesTableName} (
                     data,
                     path,
@@ -389,29 +441,29 @@ export async function insertAudioFile(
                     @updated_at
                 )
             `);
-        const created_at = new Date().toISOString();
-        const insertResult = insertStmt.run({
-            ...audioFile,
-            selected: 1,
-            created_at,
-            updated_at: created_at,
-        });
-        const id = insertResult.lastInsertRowid;
+            const created_at = new Date().toISOString();
+            const insertResult = insertStmt.run({
+                ...audioFile,
+                selected: 1,
+                created_at,
+                updated_at: created_at,
+            });
+            const id = insertResult.lastInsertRowid;
 
-        output = {
-            success: true,
-            result: [{ ...audioFile, id: id as number }],
-        };
-    } catch (error: any) {
-        console.error("Insert audio file error:", error);
-        output = {
-            success: false,
-            error: { message: error.message, stack: error.stack },
-        };
-    } finally {
-        db.close();
-    }
-    return output;
+            output = {
+                success: true,
+                result: [{ ...audioFile, id: id as number }],
+            };
+        } catch (error: any) {
+            console.error("Insert audio file error:", error);
+            output = {
+                success: false,
+                error: { message: error.message, stack: error.stack },
+            };
+        }
+
+        return output;
+    });
 }
 
 /**
@@ -423,64 +475,63 @@ export async function insertAudioFile(
 async function updateAudioFiles(
     audioFileUpdates: ModifiedAudioFileArgs[],
 ): Promise<LegacyDatabaseResponse<AudioFile[]>> {
-    const db = connect();
-    let output: LegacyDatabaseResponse<AudioFile[]> = { success: true };
-    try {
-        for (const audioFileUpdate of audioFileUpdates) {
-            // Generate the SET clause of the SQL query
-            const setClause = Object.keys(audioFileUpdate)
-                .map((key) => `${key} = @${key}`)
-                .join(", ");
+    return await withPersistentDb(async (db) => {
+        let output: LegacyDatabaseResponse<AudioFile[]> = { success: true };
+        try {
+            for (const audioFileUpdate of audioFileUpdates) {
+                // Generate the SET clause of the SQL query
+                const setClause = Object.keys(audioFileUpdate)
+                    .map((key) => `${key} = @${key}`)
+                    .join(", ");
 
-            // Check if the SET clause is empty
-            if (setClause.length === 0) {
-                throw new Error("No valid properties to update");
-            }
+                // Check if the SET clause is empty
+                if (setClause.length === 0) {
+                    throw new Error("No valid properties to update");
+                }
 
-            let existingAudioFiles = await getAudioFilesDetails();
-            const previousState = existingAudioFiles.find(
-                (audioFile) => audioFile.id === audioFileUpdate.id,
-            );
-            if (!previousState) {
-                console.error(
-                    `No audio file found with ID ${audioFileUpdate.id}`,
+                let existingAudioFiles = await getAudioFilesDetails(db);
+                const previousState = existingAudioFiles.find(
+                    (audioFile) => audioFile.id === audioFileUpdate.id,
                 );
-                continue;
-            }
-            const stmt = db.prepare(`
+                if (!previousState) {
+                    console.error(
+                        `No audio file found with ID ${audioFileUpdate.id}`,
+                    );
+                    continue;
+                }
+                const stmt = db.prepare(`
                 UPDATE ${Constants.AudioFilesTableName}
                 SET ${setClause}, updated_at = @new_updated_at
                 WHERE id = @id
             `);
 
-            await stmt.run({
-                ...audioFileUpdate,
-                new_updated_at: new Date().toISOString(),
-            });
+                await stmt.run({
+                    ...audioFileUpdate,
+                    new_updated_at: new Date().toISOString(),
+                });
 
-            // Get the new audio file
-            existingAudioFiles = await getAudioFilesDetails();
-            const newAudioFile = existingAudioFiles.find(
-                (audioFile) => audioFile.id === audioFileUpdate.id,
-            );
-            if (!newAudioFile) {
-                console.error(
-                    `No audio file found with ID ${audioFileUpdate.id}`,
+                // Get the new audio file
+                existingAudioFiles = await getAudioFilesDetails(db);
+                const newAudioFile = existingAudioFiles.find(
+                    (audioFile) => audioFile.id === audioFileUpdate.id,
                 );
-                continue;
+                if (!newAudioFile) {
+                    console.error(
+                        `No audio file found with ID ${audioFileUpdate.id}`,
+                    );
+                    continue;
+                }
             }
+            output = { success: true };
+        } catch (error: any) {
+            console.error(error);
+            output = {
+                success: false,
+                error: { message: error.message, stack: error.stack },
+            };
         }
-        output = { success: true };
-    } catch (error: any) {
-        console.error(error);
-        output = {
-            success: false,
-            error: { message: error.message, stack: error.stack },
-        };
-    } finally {
-        db.close();
-    }
-    return output;
+        return output;
+    });
 }
 
 /**
@@ -490,30 +541,30 @@ async function updateAudioFiles(
  * @returns {success: boolean, error?: string}
  */
 async function deleteAudioFile(audioFileId: number): Promise<AudioFile | null> {
-    const db = connect();
-    try {
-        const wasSelectedStmt = db.prepare(
-            `SELECT selected FROM ${Constants.AudioFilesTableName} WHERE id = ?`,
-        );
-        const wasSelected = (wasSelectedStmt.get(audioFileId) as any)?.selected;
+    return await withPersistentDb(async (db) => {
+        try {
+            const wasSelectedStmt = db.prepare(
+                `SELECT selected FROM ${Constants.AudioFilesTableName} WHERE id = ?`,
+            );
+            const wasSelected = (wasSelectedStmt.get(audioFileId) as any)
+                ?.selected;
 
-        const deleteStmt = db.prepare(
-            `DELETE FROM ${Constants.AudioFilesTableName} WHERE id = ?`,
-        );
-        deleteStmt.run(audioFileId);
+            const deleteStmt = db.prepare(
+                `DELETE FROM ${Constants.AudioFilesTableName} WHERE id = ?`,
+            );
+            deleteStmt.run(audioFileId);
 
-        if (wasSelected) {
-            const newSelectedFile = await getSelectedAudioFile(db);
-            if (newSelectedFile) {
-                await setSelectAudioFile(newSelectedFile.id);
+            if (wasSelected) {
+                const newSelectedFile = await getSelectedAudioFile(db);
+                if (newSelectedFile) {
+                    await setSelectAudioFile(newSelectedFile.id, db);
+                }
             }
+        } catch (error: any) {
+            console.error(error);
+            throw error;
         }
-    } catch (error: any) {
-        console.error(error);
-        throw error;
-    } finally {
-        db.close();
-    }
 
-    return getSelectedAudioFile();
+        return await getSelectedAudioFile(db);
+    });
 }
